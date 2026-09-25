@@ -75,6 +75,7 @@ private func configureSandboxExtension() {
 
 LocalizationBundle.activate()
 JITController.shared.start()
+LiveContainerLaunchAlert.shared.start()
 
 if #unavailable(iOS 14.0),
    getEntitlementValue("com.apple.private.security.no-sandbox") {
