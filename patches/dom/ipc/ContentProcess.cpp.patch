@@ -1,0 +1,28 @@
+diff --git a/dom/ipc/ContentProcess.cpp b/dom/ipc/ContentProcess.cpp
+index 235691e3a2be..2903ba97da09 100644
+--- a/dom/ipc/ContentProcess.cpp
++++ b/dom/ipc/ContentProcess.cpp
+@@ -21,9 +21,23 @@
+ #include "nsAppRunner.h"
+ #include "nsCategoryManagerUtils.h"
+ 
++#if defined(XP_IOS)
++#  include "prenv.h"
++#endif
++
+ namespace mozilla::dom {
+ 
+ static nsresult GetGREDir(nsIFile** aResult) {
++#if defined(XP_IOS)
++  // Inside LiveContainer, Reynard's child processes run in LiveContainer's
++  // LiveProcess extension, so the GRE directory cannot be derived from the
++  // main bundle. The LiveContainer loader passes it explicitly.
++  const char* liveContainerGREDir = PR_GetEnv("REYNARD_LC_GRE_DIR");
++  if (liveContainerGREDir && *liveContainerGREDir) {
++    return XRE_GetFileFromPath(liveContainerGREDir, aResult);
++  }
++#endif
++
+   nsCOMPtr<nsIFile> current;
+   nsresult rv = XRE_GetBinaryPath(getter_AddRefs(current));
+   NS_ENSURE_SUCCESS(rv, rv);
