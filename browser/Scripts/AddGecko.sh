@@ -22,6 +22,14 @@ mkdir -p "${GECKOVIEW_FW_FRAMEWORKS}"
 cp -fL "${GECKO_DIST_BIN}/"*.dylib "${FRAMEWORKS_DIR}/"
 cp -fL "${GECKO_DIST_BIN}/XUL" "${FRAMEWORKS_DIR}/XUL"
 
+# build the LiveContainer child process loader (signed with the dylibs below)
+xcrun clang -target "arm64-apple-ios${IPHONEOS_DEPLOYMENT_TARGET}${LLVM_TARGET_TRIPLE_SUFFIX:-}" \
+	-isysroot "${SDKROOT}" -Os -fobjc-arc -dynamiclib \
+	-install_name @rpath/ReynardLiveContainerLoader.dylib \
+	-framework Foundation \
+	"${SRCROOT}/LiveContainer/ReynardLiveContainerLoader.m" \
+	-o "${FRAMEWORKS_DIR}/ReynardLiveContainerLoader.dylib"
+
 for file in "${FRAMEWORKS_DIR}/XUL" "${FRAMEWORKS_DIR}/"*.dylib; do
 	if [ -f "${file}" ]; then
 		codesign --force --sign "${SIGN_IDENTITY}" --preserve-metadata=identifier,entitlements "${file}"
