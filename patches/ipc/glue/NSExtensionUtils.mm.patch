@@ -1,9 +1,9 @@
 diff --git a/ipc/glue/NSExtensionUtils.mm b/ipc/glue/NSExtensionUtils.mm
 new file mode 100644
-index 000000000000..c83af197c98c
+index 000000000000..12803341d750
 --- /dev/null
 +++ b/ipc/glue/NSExtensionUtils.mm
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,597 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -92,15 +92,22 @@ index 000000000000..c83af197c98c
 +  return queue;
 +}
 +
++// Under LiveContainer, errors the user can fix (Reynard's setup in
++// LiveContainer) use this code; they are shown in an alert right away.
++static const NSInteger kLiveContainerSetupErrorCode = 2;
++
 +static NSError* ExtensionLaunchError(NSString* description,
-+                                     NSError* _Nullable underlying = nil) {
++                                     NSError* _Nullable underlying = nil,
++                                     NSInteger code = 1) {
 +  NSDictionary* userInfo = underlying
 +                               ? @{
 +                                   NSLocalizedDescriptionKey : description,
 +                                   NSUnderlyingErrorKey : underlying,
 +                                 }
 +                               : @{NSLocalizedDescriptionKey : description};
-+  return [NSError errorWithDomain:@"ReynardExtension" code:1 userInfo:userInfo];
++  return [NSError errorWithDomain:@"ReynardExtension"
++                             code:code
++                         userInfo:userInfo];
 +}
 +
 +// LiveContainer support.
@@ -198,7 +205,8 @@ index 000000000000..c83af197c98c
 +    *aError = ExtensionLaunchError(
 +        @"Reynard must be a LiveContainer shared app to run inside "
 +        @"LiveContainer. In LiveContainer, long-press Reynard and choose "
-+        @"\"Convert to Shared App\".");
++        @"\"Convert to Shared App\".",
++        nil, kLiveContainerSetupErrorCode);
 +    return nil;
 +  }
 +
@@ -210,14 +218,16 @@ index 000000000000..c83af197c98c
 +        @"Reynard needs LiveContainer's JIT-less mode to run inside "
 +        @"LiveContainer. In LiveContainer settings, tap \"Import Certificate "
 +        @"from SideStore\" or \"Import Certificate\", then open Reynard "
-+        @"again.");
++        @"again.",
++        nil, kLiveContainerSetupErrorCode);
 +    return nil;
 +  }
 +
 +  NSString* frameworksPath = [[NSBundle mainBundle] privateFrameworksPath];
 +  if (!frameworksPath) {
 +    *aError = ExtensionLaunchError(
-+        @"Unable to resolve the Frameworks directory of Reynard.app");
++        @"Unable to resolve the Frameworks directory of Reynard.app", nil,
++        kLiveContainerSetupErrorCode);
 +    return nil;
 +  }
 +
@@ -232,7 +242,8 @@ index 000000000000..c83af197c98c
 +  for (NSString* path in @[ loaderPath, geckoViewPath, greDir ]) {
 +    if (![fileManager fileExistsAtPath:path]) {
 +      *aError = ExtensionLaunchError(
-+          [NSString stringWithFormat:@"Missing %@", path]);
++          [NSString stringWithFormat:@"Missing %@", path], nil,
++          kLiveContainerSetupErrorCode);
 +      return nil;
 +    }
 +  }
@@ -244,6 +255,38 @@ index 000000000000..c83af197c98c
 +    @"reynardGeckoViewPath" : geckoViewPath,
 +    @"reynardGREDir" : greDir,
 +  };
++}
++
++// Only accessed on ExtensionCompletionQueue.
++static int sLiveContainerTransientFailures = 0;
++
++static void ReynardLiveContainerLaunchSucceeded() {
++  sLiveContainerTransientFailures = 0;
++}
++
++// Logs a failed child process launch under LiveContainer and tells the app,
++// which shows the reason in an alert. Timeouts and interruptions can be
++// transient (for example Reynard was suspended mid-launch), so they are only
++// reported when launches keep failing.
++static void ReynardLiveContainerLaunchFailed(NSError* aError) {
++  NSLog(@"[Reynard] LiveContainer child process launch failed: %@", aError);
++
++  if ([aError code] != kLiveContainerSetupErrorCode &&
++      ++sLiveContainerTransientFailures < 2) {
++    return;
++  }
++
++  NSString* message = [aError localizedDescription];
++  NSError* underlying = [[aError userInfo] objectForKey:NSUnderlyingErrorKey];
++  if ([underlying isKindOfClass:[NSError class]]) {
++    message = [NSString stringWithFormat:@"%@\n\n%@", message,
++                                         [underlying localizedDescription]];
++  }
++
++  [[NSNotificationCenter defaultCenter]
++      postNotificationName:@"Reynard.LiveContainerChildProcessLaunchFailed"
++                    object:nil
++                  userInfo:@{NSLocalizedDescriptionKey : message}];
 +}
 +
 +static NSString* _Nullable GetExtensionIdentifier() {
@@ -346,11 +389,14 @@ index 000000000000..c83af197c98c
 +
 +    NSString* extensionIdentifier = GetExtensionIdentifier();
 +    if (!extensionIdentifier) {
-+      completeOnce(ExtensionLaunchError(
++      completeOnce(
 +          underLiveContainer
-+              ? @"LiveContainer's LiveProcess extension was not found. "
-+                @"Reinstall LiveContainer and keep its app extensions."
-+              : @"Unable to resolve extension bundle identifier"));
++              ? ExtensionLaunchError(
++                    @"LiveContainer's LiveProcess extension was not found. "
++                    @"Reinstall LiveContainer and keep its app extensions.",
++                    nil, kLiveContainerSetupErrorCode)
++              : ExtensionLaunchError(
++                    @"Unable to resolve extension bundle identifier"));
 +      return;
 +    }
 +
@@ -358,17 +404,18 @@ index 000000000000..c83af197c98c
 +    mExtension = [[NSExtension extensionWithIdentifier:extensionIdentifier
 +                                                 error:&extensionError] retain];
 +    if (!mExtension) {
-+      completeOnce(ExtensionLaunchError(@"Failed to create NSExtension",
-+                                        extensionError));
++      completeOnce(ExtensionLaunchError(
++          @"Failed to create NSExtension", extensionError,
++          underLiveContainer ? kLiveContainerSetupErrorCode : 1));
 +      return;
 +    }
 +
 +    [mExtension setRequestInterruptionBlock:^(NSUUID* requestIdentifier) {
 +      completeOnce(ExtensionLaunchError(
 +          underLiveContainer
-+              ? @"LiveProcess exited before connecting back. It may have "
-+                @"failed to load ReynardLiveContainerLoader.dylib, which "
-+                @"needs Reynard to be signed by LiveContainer (JIT-less mode)."
++              ? @"LiveProcess keeps exiting before it connects back. Make "
++                @"sure LiveContainer signs Reynard (JIT-less mode, with "
++                @"signing not turned off for Reynard)."
 +              : @"NSExtension request interrupted before bootstrap"));
 +    }];
 +
@@ -379,7 +426,8 @@ index 000000000000..c83af197c98c
 +      [mExtension setRequestCancellationBlock:^(NSUUID* requestIdentifier,
 +                                                NSError* _Nullable error) {
 +        completeOnce(ExtensionLaunchError(
-+            @"LiveProcess cancelled the child process request", error));
++            @"LiveProcess cancelled the child process request", error,
++            kLiveContainerSetupErrorCode));
 +      }];
 +    }
 +
@@ -492,14 +540,19 @@ index 000000000000..c83af197c98c
 +  [process startWithCompletion:^(NSError* error) {
 +    if (error) {
 +      if (ReynardUnderLiveContainer()) {
-+        NSLog(@"[Reynard] LiveContainer child process launch failed: %@",
-+              error);
++        ReynardLiveContainerLaunchFailed(error);
++        // The completion block retains `process`, so release alone leaves it
++        // alive; invalidate refuses a late LiveProcess and cancels the request.
++        [process invalidate];
 +      }
 +      [process release];
 +      (*ownedCompletion)(Err(LaunchError("NSExtensionProcess::StartProcess")));
 +      return;
 +    }
 +
++    if (ReynardUnderLiveContainer()) {
++      ReynardLiveContainerLaunchSucceeded();
++    }
 +    (*ownedCompletion)(NSExtensionProcess(process));
 +  }];
 +}
