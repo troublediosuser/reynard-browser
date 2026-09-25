@@ -1,9 +1,9 @@
 diff --git a/ipc/glue/NSExtensionUtils.mm b/ipc/glue/NSExtensionUtils.mm
 new file mode 100644
-index 000000000000..518377a5f5dd
+index 000000000000..c83af197c98c
 --- /dev/null
 +++ b/ipc/glue/NSExtensionUtils.mm
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,544 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -15,6 +15,7 @@ index 000000000000..518377a5f5dd
 +#include "LaunchError.h"
 +
 +#import <Foundation/Foundation.h>
++#import <objc/message.h>
 +#include <memory>
 +
 +#import "mozilla/widget/GeckoViewSupport.h"
@@ -32,6 +33,9 @@ index 000000000000..518377a5f5dd
 +- (void)cancelExtensionRequestWithIdentifier:(NSUUID*)requestIdentifier;
 +- (void)setRequestInterruptionBlock:
 +    (void (^_Nonnull)(NSUUID* requestIdentifier))block;
++- (void)setRequestCancellationBlock:
++    (void (^_Nonnull)(NSUUID* requestIdentifier,
++                      NSError* _Nullable error))block;
 +@end
 +
 +@interface NSXPCConnection (Private)
@@ -99,7 +103,154 @@ index 000000000000..518377a5f5dd
 +  return [NSError errorWithDomain:@"ReynardExtension" code:1 userInfo:userInfo];
 +}
 +
++// LiveContainer support.
++//
++// Inside LiveContainer, iOS does not know about a guest app's extensions, so
++// "Reynard Helper.appex" cannot be launched. Child processes are hosted by
++// LiveContainer's own LiveProcess extension instead: LiveProcess loads
++// ReynardLiveContainerLoader.dylib (its "customPayloadDylib" feature), and the
++// loader boots the Gecko child the same way Reynard Helper does.
++//
++// LCSharedUtils only exists in a LiveContainer guest process, so none of the
++// code paths below run on normal installs.
++
++static bool ReynardUnderLiveContainer() {
++  return NSClassFromString(@"LCSharedUtils") != Nil;
++}
++
++// +[NSUserDefaults isLiveProcess] and +isSharedApp return C bool.
++static bool ReynardLiveContainerFlag(NSString* aSelectorName) {
++  SEL selector = NSSelectorFromString(aSelectorName);
++  Class defaults = [NSUserDefaults class];
++  if (![defaults respondsToSelector:selector]) {
++    return false;
++  }
++  return ((bool (*)(id, SEL))objc_msgSend)(defaults, selector);
++}
++
++// +[NSUserDefaults lcMainBundle] is LiveContainer.app, or LiveProcess.appex
++// when Reynard itself runs in LiveContainer's multitask mode.
++static NSBundle* _Nullable ReynardLiveContainerMainBundle() {
++  SEL selector = NSSelectorFromString(@"lcMainBundle");
++  Class defaults = [NSUserDefaults class];
++  if (![defaults respondsToSelector:selector]) {
++    return nil;
++  }
++  id bundle = ((id (*)(id, SEL))objc_msgSend)(defaults, selector);
++  return [bundle isKindOfClass:[NSBundle class]] ? bundle : nil;
++}
++
++static bool ReynardLiveContainerRespondsTo(NSString* aSelectorName) {
++  return [NSClassFromString(@"LCSharedUtils")
++      respondsToSelector:NSSelectorFromString(aSelectorName)];
++}
++
++// Calls a +[LCSharedUtils ...] method that returns an object.
++static id _Nullable ReynardLiveContainerValue(NSString* aSelectorName) {
++  if (!ReynardLiveContainerRespondsTo(aSelectorName)) {
++    return nil;
++  }
++  return ((id (*)(id, SEL))objc_msgSend)(NSClassFromString(@"LCSharedUtils"),
++                                         NSSelectorFromString(aSelectorName));
++}
++
++static NSString* _Nullable GetLiveContainerExtensionIdentifier() {
++  NSBundle* lcBundle = ReynardLiveContainerMainBundle();
++  if (!lcBundle) {
++    return nil;
++  }
++
++  if (ReynardLiveContainerFlag(@"isLiveProcess")) {
++    return [lcBundle bundleIdentifier];
++  }
++
++  NSURL* plugInsURL = [lcBundle builtInPlugInsURL];
++  if (plugInsURL) {
++    NSURL* extensionURL =
++        [plugInsURL URLByAppendingPathComponent:@"LiveProcess.appex"];
++    NSString* identifier =
++        [[NSBundle bundleWithURL:extensionURL] bundleIdentifier];
++    if (identifier) {
++      return identifier;
++    }
++  }
++
++  // Additional LiveContainer installs (LiveContainer2 and later) ship without
++  // app extensions and use the first LiveContainer's LiveProcess, the same
++  // way +[LCUtils liveProcessBundleIdentifier] finds it.
++  id teamIdentifier = ReynardLiveContainerValue(@"teamIdentifier");
++  if (![teamIdentifier isKindOfClass:[NSString class]]) {
++    return nil;
++  }
++  NSString* identifier = [NSString
++      stringWithFormat:@"com.kdt.livecontainer.%@.LiveProcess", teamIdentifier];
++  return [NSExtension extensionWithIdentifier:identifier error:nil] ? identifier
++                                                                    : nil;
++}
++
++// Builds the LiveProcess request. LiveProcess loads customPayloadDylib before
++// it resolves any bookmarks, so the loader and GeckoView must be readable
++// without one. That is only true for LiveContainer "shared apps", whose bundle
++// lives in the App Group container.
++static NSDictionary* _Nullable ReynardLiveContainerUserInfo(
++    NSXPCListenerEndpoint* aEndpoint, NSError* _Nullable* _Nonnull aError) {
++  if (!ReynardLiveContainerFlag(@"isSharedApp")) {
++    *aError = ExtensionLaunchError(
++        @"Reynard must be a LiveContainer shared app to run inside "
++        @"LiveContainer. In LiveContainer, long-press Reynard and choose "
++        @"\"Convert to Shared App\".");
++    return nil;
++  }
++
++  // Without a certificate, LiveContainer runs guest apps with JIT and does not
++  // re-sign them, and LiveProcess cannot load unsigned code as a payload.
++  if (ReynardLiveContainerRespondsTo(@"certificatePassword") &&
++      !ReynardLiveContainerValue(@"certificatePassword")) {
++    *aError = ExtensionLaunchError(
++        @"Reynard needs LiveContainer's JIT-less mode to run inside "
++        @"LiveContainer. In LiveContainer settings, tap \"Import Certificate "
++        @"from SideStore\" or \"Import Certificate\", then open Reynard "
++        @"again.");
++    return nil;
++  }
++
++  NSString* frameworksPath = [[NSBundle mainBundle] privateFrameworksPath];
++  if (!frameworksPath) {
++    *aError = ExtensionLaunchError(
++        @"Unable to resolve the Frameworks directory of Reynard.app");
++    return nil;
++  }
++
++  NSString* loaderPath = [frameworksPath
++      stringByAppendingPathComponent:@"ReynardLiveContainerLoader.dylib"];
++  NSString* geckoViewPath = [frameworksPath
++      stringByAppendingPathComponent:@"GeckoView.framework/GeckoView"];
++  NSString* greDir = [frameworksPath
++      stringByAppendingPathComponent:@"GeckoView.framework/Frameworks"];
++
++  NSFileManager* fileManager = [NSFileManager defaultManager];
++  for (NSString* path in @[ loaderPath, geckoViewPath, greDir ]) {
++    if (![fileManager fileExistsAtPath:path]) {
++      *aError = ExtensionLaunchError(
++          [NSString stringWithFormat:@"Missing %@", path]);
++      return nil;
++    }
++  }
++
++  return @{
++    @"ReynardXPCListenerEndpoint" : aEndpoint,
++    @"customPayloadDylib" : loaderPath,
++    @"customPayloadEntry" : @"ReynardLiveContainerPayloadMain",
++    @"reynardGeckoViewPath" : geckoViewPath,
++    @"reynardGREDir" : greDir,
++  };
++}
++
 +static NSString* _Nullable GetExtensionIdentifier() {
++  if (ReynardUnderLiveContainer()) {
++    return GetLiveContainerExtensionIdentifier();
++  }
++
 +  NSURL* plugInsURL = [[NSBundle mainBundle] builtInPlugInsURL];
 +  if (!plugInsURL) {
 +    return nil;
@@ -135,6 +286,7 @@ index 000000000000..518377a5f5dd
 +  void (^completion)(NSError* _Nullable) = [aCompletion copy];
 +
 +  dispatch_async(ExtensionLaunchQueue(), ^{
++    const bool underLiveContainer = ReynardUnderLiveContainer();
 +    __block bool completed = false;
 +    void (^completeOnce)(NSError* _Nullable) = ^(NSError* _Nullable error) {
 +      dispatch_async(ExtensionCompletionQueue(), ^{
@@ -195,7 +347,10 @@ index 000000000000..518377a5f5dd
 +    NSString* extensionIdentifier = GetExtensionIdentifier();
 +    if (!extensionIdentifier) {
 +      completeOnce(ExtensionLaunchError(
-+          @"Unable to resolve extension bundle identifier"));
++          underLiveContainer
++              ? @"LiveContainer's LiveProcess extension was not found. "
++                @"Reinstall LiveContainer and keep its app extensions."
++              : @"Unable to resolve extension bundle identifier"));
 +      return;
 +    }
 +
@@ -210,11 +365,37 @@ index 000000000000..518377a5f5dd
 +
 +    [mExtension setRequestInterruptionBlock:^(NSUUID* requestIdentifier) {
 +      completeOnce(ExtensionLaunchError(
-+          @"NSExtension request interrupted before bootstrap"));
++          underLiveContainer
++              ? @"LiveProcess exited before connecting back. It may have "
++                @"failed to load ReynardLiveContainerLoader.dylib, which "
++                @"needs Reynard to be signed by LiveContainer (JIT-less mode)."
++              : @"NSExtension request interrupted before bootstrap"));
 +    }];
 +
++    // The LiveContainer loader cancels the request with a descriptive error
++    // when it cannot boot the Gecko child.
++    if (underLiveContainer &&
++        [mExtension respondsToSelector:@selector(setRequestCancellationBlock:)]) {
++      [mExtension setRequestCancellationBlock:^(NSUUID* requestIdentifier,
++                                                NSError* _Nullable error) {
++        completeOnce(ExtensionLaunchError(
++            @"LiveProcess cancelled the child process request", error));
++      }];
++    }
++
 +    NSExtensionItem* input = [[[NSExtensionItem alloc] init] autorelease];
-+    [input setUserInfo:@{@"ReynardXPCListenerEndpoint" : [mListener endpoint]}];
++    if (underLiveContainer) {
++      NSError* userInfoError = nil;
++      NSDictionary* userInfo =
++          ReynardLiveContainerUserInfo([mListener endpoint], &userInfoError);
++      if (!userInfo) {
++        completeOnce(userInfoError);
++        return;
++      }
++      [input setUserInfo:userInfo];
++    } else {
++      [input setUserInfo:@{@"ReynardXPCListenerEndpoint" : [mListener endpoint]}];
++    }
 +
 +    NSError* requestError = nil;
 +    mRequestIdentifier =
@@ -226,8 +407,11 @@ index 000000000000..518377a5f5dd
 +      return;
 +    }
 +
++    // LiveProcess also has to load the loader, GeckoView and XUL before it can
++    // connect back, so give it longer.
++    const uint64_t timeoutSeconds = underLiveContainer ? 20 : 8;
 +    dispatch_after(
-+        dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC),
++        dispatch_time(DISPATCH_TIME_NOW, timeoutSeconds * NSEC_PER_SEC),
 +        ExtensionLaunchQueue(), ^{
 +          completeOnce(ExtensionLaunchError(
 +              @"Timed out waiting for child extension NSXPC connection"));
@@ -307,6 +491,10 @@ index 000000000000..518377a5f5dd
 +
 +  [process startWithCompletion:^(NSError* error) {
 +    if (error) {
++      if (ReynardUnderLiveContainer()) {
++        NSLog(@"[Reynard] LiveContainer child process launch failed: %@",
++              error);
++      }
 +      [process release];
 +      (*ownedCompletion)(Err(LaunchError("NSExtensionProcess::StartProcess")));
 +      return;
