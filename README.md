@@ -2,6 +2,15 @@
 
 # Reynard Browser
 
+> [!NOTE]
+> **This is an unofficial fork that runs Reynard inside [LiveContainer](https://github.com/LiveContainer/LiveContainer).** The Reynard maintainers do not support it. Report LiveContainer problems in [this fork's issues](https://github.com/troublediosuser/reynard-browser/issues), not upstream. For everything else, see [minh-ton/reynard-browser](https://github.com/minh-ton/reynard-browser).
+>
+> Requirements:
+> - LiveContainer 3.8.0 or later.
+> - Reynard installed as a shared app: long-press it in LiveContainer, then choose **Convert to Shared App**.
+>
+> Download the `.ipa` from this fork's [Releases](https://github.com/troublediosuser/reynard-browser/releases). The fork is rebased onto each upstream release. The rest of this README is upstream's.
+
 Reynard is a **Gecko-based** web browser for iOS 13+.
 
 Unlike other browsers on iOS that are forced to use Apple's **WebKit** engine (including Safari and all third-party browsers), Reynard uses **Gecko**. This is the same engine that powers the Firefox browser on desktop and Android devices.
